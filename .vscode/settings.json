@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "/Users/zho/miniconda3/envs/BCI_learn_I/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "http.proxy": "http://127.0.0.1:7897"  // bc of China fire Great wall
+}

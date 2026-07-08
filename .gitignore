@@ -23,3 +23,7 @@ Thumbs.db
 
 # Conda
 .python-version
+
+# Datasets
+scikit_learn_data/
+mne_data/

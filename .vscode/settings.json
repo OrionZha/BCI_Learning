@@ -6,5 +6,7 @@
     "terminal.integrated.env.osx": {
         "SCIKIT_LEARN_DATA": "/Users/zho/code/BCI_Learning/scikit_learn_data",
         "MNE_DATA": "/Users/zho/code/BCI_Learning/mne_data"
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

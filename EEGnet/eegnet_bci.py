@@ -211,6 +211,77 @@ def eval_epoch(model, loader, device):
     return total_loss / total, correct / total
 
 
+@torch.no_grad()
+def detailed_eval(model, loader, device):
+    """返回 all_preds, all_targets — 用于计算混淆矩阵和 p 值."""
+    model.eval()
+    all_preds, all_targets = [], []
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+        output = model(data)
+        all_preds.append(output.argmax(1).cpu().numpy())
+        all_targets.append(target.cpu().numpy())
+    return np.concatenate(all_preds), np.concatenate(all_targets)
+
+
+def compute_metrics(y_true, y_pred, class_names):
+    """
+    计算四分类指标:
+      - 混淆矩阵
+      - 每类准确率 (recall)
+      - 整体准确率 + 二项检验 p 值 (H0: acc = 25%)
+    """
+    from scipy.stats import binomtest
+
+    n_total = len(y_true)
+    correct = (y_pred == y_true).sum()
+    acc = correct / n_total
+
+    # p 值: P(X ≥ correct | X ~ Binomial(n_total, 0.25))
+    result = binomtest(correct, n=n_total, p=0.25, alternative='greater')
+    p_value = result.pvalue
+
+    # 混淆矩阵 & 每类召回率
+    n_cls = len(class_names)
+    cm = np.zeros((n_cls, n_cls), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t, p] += 1
+
+    per_class_acc = {}
+    for i, name in enumerate(class_names):
+        row_sum = cm[i].sum()
+        per_class_acc[name] = cm[i, i] / row_sum if row_sum > 0 else 0.0
+
+    return {
+        'accuracy': acc,
+        'correct': correct,
+        'total': n_total,
+        'p_value': p_value,
+        'confusion_matrix': cm,
+        'per_class_acc': per_class_acc,
+    }
+
+
+def print_metrics(metrics, class_names, title=""):
+    """格式化打印分类报告."""
+    m = metrics
+    stars = " ***" if m['p_value'] < 0.001 else (
+        " **" if m['p_value'] < 0.01 else (" *" if m['p_value'] < 0.05 else ""))
+    print(f"\n{'='*56}")
+    if title:
+        print(f"  {title}")
+    print(f"  Overall Accuracy: {m['accuracy']:.2%} ({m['correct']}/{m['total']})")
+    print(f"  p-value (vs chance 25%): {m['p_value']:.2e}{stars}")
+    print(f"  {'Class':>12s}  {'Recall':>8s}  #samples")
+    print(f"  {'-'*36}")
+    for i, name in enumerate(class_names):
+        row = m['confusion_matrix'][i]
+        print(f"  {name:>12s}  {m['per_class_acc'][name]:7.2%}  "
+              f"({row.sum()})")
+    print(f"{'='*56}\n")
+    return m
+
+
 def build_device():
     if torch.cuda.is_available():
         return torch.device('cuda')
@@ -251,7 +322,11 @@ def run_one(epochs, batch_size, X_train, y_train, X_test, y_test,
                   f"test_loss={t_loss:.4f}  test_acc={t_acc:.2%}  "
                   f"[{elapsed:.0f}s]")
 
-    return test_losses, test_accs
+    # Final detailed evaluation
+    y_pred, y_true = detailed_eval(model, test_loader, device)
+    metrics = compute_metrics(y_true, y_pred, CLASS_NAMES)
+
+    return test_losses, test_accs, metrics, model
 
 
 # ======================= Plotting =======================
@@ -269,31 +344,62 @@ def _get_style(batch_idx):
 
 # ======================= Caching =======================
 
+def _cache_fingerprint():
+    """当前参数的唯一标识 — 参数变了缓存自动失效."""
+    import json
+    return json.dumps([EPOCHS_LIST, BATCH_LIST], sort_keys=True)
+
+
 def save_cache(results, cache_path):
-    """保存结果到 npz 文件，key 格式为 '1500_100_loss', '1500_100_acc' 等."""
+    """保存结果到 npz 文件, 附带参数指纹."""
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    flat = {}
-    for (ep, bs), (losses, accs) in results.items():
+    flat = {'__fingerprint': _cache_fingerprint()}
+    for (ep, bs), (losses, accs, metrics) in results.items():
         flat[f"{ep}_{bs}_loss"] = np.array(losses, dtype=np.float32)
         flat[f"{ep}_{bs}_acc"] = np.array(accs, dtype=np.float32)
+        flat[f"{ep}_{bs}_pval"] = metrics['p_value']
+        flat[f"{ep}_{bs}_cm"] = metrics['confusion_matrix']
+        for i, name in enumerate(CLASS_NAMES):
+            flat[f"{ep}_{bs}_recall_{name}"] = metrics['per_class_acc'][name]
     np.savez(cache_path, **flat)
     print(f"Cache saved → {cache_path}")
 
 
 def load_cache(cache_path):
-    """加载缓存，返回 {(epochs, batch): (losses, accs)} 或空 dict."""
+    """加载缓存; 参数改动时自动清除旧缓存."""
     if not os.path.exists(cache_path):
         return {}
-    data = np.load(cache_path)
+    data = np.load(cache_path, allow_pickle=True)
+
+    # 指纹不匹配 → 清缓存
+    if '__fingerprint' not in data.files or \
+       str(data['__fingerprint']) != _cache_fingerprint():
+        print("Cache params changed — clearing old cache")
+        os.remove(cache_path)
+        return {}
+
     results = {}
     for key in data.files:
+        if key.startswith('__'):
+            continue
         if key.endswith('_loss'):
             parts = key.replace('_loss', '').split('_', 1)
             ep, bs = int(parts[0]), int(parts[1])
             losses = data[key].tolist()
-            acc_key = key.replace('_loss', '_acc')
-            accs = data[acc_key].tolist() if acc_key in data.files else []
-            results[(ep, bs)] = (losses, accs)
+            accs = data[f"{ep}_{bs}_acc"].tolist()
+            metrics = {
+                'accuracy': accs[-1],
+                'p_value': float(data.get(f"{ep}_{bs}_pval", np.nan)),
+                'confusion_matrix': data.get(f"{ep}_{bs}_cm", np.zeros((4, 4))),
+                'per_class_acc': {},
+                'correct': 0,
+                'total': 0,
+            }
+            for i, name in enumerate(CLASS_NAMES):
+                k = f"{ep}_{bs}_recall_{name}"
+                if k in data.files:
+                    metrics['per_class_acc'][name] = float(data[k])
+            results[(ep, bs)] = (losses, accs, metrics)
     print(f"Loaded {len(results)} cached results from {cache_path}")
     return results
 
@@ -317,7 +423,7 @@ def plot_all(results, output_dir):
     # ============ Test Loss ============
     fig, ax = plt.subplots(figsize=(16, 10))
     for epochs, batch in combos:
-        losses, _ = results[(epochs, batch)]
+        losses = results[(epochs, batch)][0]
         x = range(1, len(losses) + 1)
         label = f"ep={epochs} bs={batch}"
         ax.plot(x, losses, color=color_map[batch], linestyle=style_map[batch],
@@ -337,7 +443,7 @@ def plot_all(results, output_dir):
     # ============ Test Accuracy ============
     fig, ax = plt.subplots(figsize=(16, 10))
     for epochs, batch in combos:
-        _, accs = results[(epochs, batch)]
+        accs = results[(epochs, batch)][1]
         x = range(1, len(accs) + 1)
         label = f"ep={epochs} bs={batch}"
         ax.plot(x, accs, color=color_map[batch], linestyle=style_map[batch],
@@ -357,11 +463,181 @@ def plot_all(results, output_dir):
     print(f"Saved → {path}")
 
 
+# ======================= Topomap =======================
+
+
+def plot_spatial_filters(model, output_dir, tag="", F1=8, D=2):
+    """
+    绘制 EEGNet Block1 空间滤波器 (depthwise conv) 的脑地形图。
+
+    每个子图对应一个空间滤波器，显示 22 个电极上的权重分布。
+    共 D×F1 = 16 张图（D 行，F1 列）。
+    """
+    import mne
+
+    # BCIC IV 2a 电极名称 → 10-20 标准位
+    ch_names = [
+        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
+        "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+        "CP3", "CP1", "CPz", "CP2", "CP4",
+        "P1", "Pz", "P2", "POz",
+    ]
+
+    # 创建 MNE Info（需 montage）
+    montage = mne.channels.make_standard_montage("standard_1005")
+    info = mne.create_info(ch_names=ch_names, sfreq=250, ch_types="eeg")
+    info.set_montage(montage)
+
+    # 提取空间滤波器权重: block1[1] → shape (D*F1, 1, n_channels, 1)
+    spatial_weights = model.block1[1].weight.detach().cpu().numpy()
+    n_filters = spatial_weights.shape[0]  # D * F1
+
+    # 每组 (F1=8 列, D=2 行)
+    fig, axes = plt.subplots(D, F1, figsize=(F1 * 2.5, D * 2.5))
+    # 确保 axes 可迭代
+    if D == 1:
+        axes = axes[np.newaxis, :]
+    if F1 == 1:
+        axes = axes[:, np.newaxis]
+
+    vmax = np.abs(spatial_weights).max()
+
+    for d in range(D):
+        for f in range(F1):
+            idx = d * F1 + f
+            weights_1d = spatial_weights[idx, 0, :, 0]  # (22,)
+            ax = axes[d, f]
+            mne.viz.plot_topomap(
+                weights_1d, info, axes=ax, show=False,
+                vlim=(-vmax, vmax), contours=0,
+                cmap='RdBu_r', sensors=True,
+            )
+            ax.set_title(f"F={f + 1}  D={d + 1}", fontsize=9)
+
+    fig.suptitle(f"EEGNet Spatial Filters (Depthwise Conv){tag}",
+                 fontsize=13, y=1.02)
+    fig.tight_layout()
+
+    filename = f"topomap{tag.replace(' ', '_')}.png" if tag else "topomap.png"
+    path = os.path.join(output_dir, filename)
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved → {path}")
+
+
+# ======================= Waveform plots =======================
+
+
+def plot_raw_vs_filtered(output_dir, subject=1, n_examples=3):
+    """
+    绘制原始信号 vs 带通滤波后信号的波形图。
+
+    每类选 n_examples 个 trial，对比展示 22 通道的原始波形（上排）和
+    2-40 Hz 滤波后波形（下排），保存到 output_dir/。
+    """
+    import glob
+
+    data_dir = os.path.join(
+        os.path.dirname(__file__), "mne_data", "MNE-bnci-data",
+        "~bci", "database", "001-2014",
+    )
+    mat_path = glob.glob(os.path.join(data_dir, f"A{subject:02d}T.mat"))
+    if not mat_path:
+        print("  [waveform] .mat file not found, skipping")
+        return
+    mat_path = mat_path[0]
+
+    data = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
+    run_array = data["data"] if isinstance(data["data"], np.ndarray) else [data["data"]]
+
+    sfreq = SFREQ
+    ch_names = EEG_CHANNELS
+
+    # 显示窗口: cue 前 0.5s → cue 后 3.5s (总 4s = 1000 样本)
+    cue_sample = int(2.0 * sfreq)
+    disp_start = cue_sample - int(0.5 * sfreq)   # 375
+    disp_end = cue_sample + int(3.5 * sfreq)      # 1375
+    n_disp = disp_end - disp_start
+
+    # 收集每类 trials
+    trials_by_class = {i: [] for i in range(4)}
+    for run in run_array:
+        if len(run.trial) == 0:
+            continue
+        trials = run.trial.ravel().astype(int)
+        labels = run.y.ravel().astype(int)
+        eeg_raw = run.X.astype(np.float64)
+        eeg_filt = _bandpass_filter(eeg_raw, LOWCUT, HIGHCUT, sfreq)
+        for trial_pos, label in zip(trials, labels):
+            t0 = trial_pos - 1
+            raw_seg = eeg_raw[t0 + disp_start:t0 + disp_end, :22]
+            filt_seg = eeg_filt[t0 + disp_start:t0 + disp_end, :22]
+            if raw_seg.shape[0] >= n_disp and filt_seg.shape[0] >= n_disp:
+                trials_by_class[label - 1].append((raw_seg, filt_seg))
+
+    os.makedirs(output_dir, exist_ok=True)
+    t = np.arange(n_disp) / sfreq  # 秒
+
+    for cls_idx, name in enumerate(CLASS_NAMES):
+        samples = trials_by_class[cls_idx][:n_examples]
+        if not samples:
+            continue
+
+        fig, axes = plt.subplots(
+            2, n_examples, figsize=(4 * n_examples, 10),
+            sharex=True, sharey='row',
+        )
+        if n_examples == 1:
+            axes = axes[:, np.newaxis]
+
+        for col, (raw_seg, filt_seg) in enumerate(samples):
+            # 上排: 原始信号
+            ax_raw = axes[0, col]
+            for ch in range(22):
+                ax_raw.plot(t, raw_seg[:, ch] + ch * 30, linewidth=0.4)
+            ax_raw.set_title(f"Raw — Trial {col + 1}" if col > 0 else f"Raw")
+            ax_raw.set_ylim(-80, 22 * 30 + 80)
+            if col == 0:
+                ax_raw.set_ylabel("Channel (offset)")
+
+            # 下排: 滤波后
+            ax_filt = axes[1, col]
+            for ch in range(22):
+                ax_filt.plot(t, filt_seg[:, ch] + ch * 30, linewidth=0.4)
+            ax_filt.set_title(f"Filtered {LOWCUT}–{HIGHCUT} Hz — Trial {col + 1}" if col > 0 else f"Filtered {LOWCUT}–{HIGHCUT} Hz")
+            ax_filt.set_xlabel("Time (s)")
+            if col == 0:
+                ax_filt.set_ylabel("Channel (offset)")
+
+        # 添加 cue 线
+        for row in range(2):
+            for col in range(n_examples):
+                axes[row, col].axvline(x=2.0, color='red', linestyle='--', linewidth=0.8, alpha=0.6)
+                axes[row, col].axvline(x=3.25, color='gray', linestyle=':', linewidth=0.6, alpha=0.4)
+
+        fig.suptitle(f"Subject {subject} — {name}  (red=cue onset, gray=MI start)",
+                     fontsize=12, y=1.01)
+        fig.tight_layout()
+        path = os.path.join(output_dir, f"waveform_{name}.png")
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved → {path}")
+
+
 # ============================ Main ============================
 
 def main():
     device = build_device()
     print(f"Device: {device}\n")
+
+    # ---- 创建带时间戳的输出目录 ----
+    run_dir = os.path.join(OUTPUT_DIR, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Output dir: {run_dir}/\n")
+
+    # ---- 画原始 vs 滤波波形图 ----
+    print("Plotting raw vs filtered waveforms …")
+    plot_raw_vs_filtered(run_dir, subject=SUBJECT)
 
     # Load data once
     (X_train, y_train), (X_test, y_test), meta = load_bcic_iv_2a(
@@ -380,28 +656,44 @@ def main():
     print(f"  Cached: {skipped}  |  To run: {len(new_combos)}")
     print(f"Epochs: {EPOCHS_LIST}")
     print(f"Batches: {BATCH_LIST}")
-    print(f"Output: {OUTPUT_DIR}/\n")
+    print(f"Output: {run_dir}/\n")
 
     for idx, (epochs, batch_size) in enumerate(new_combos):
         run_label = f"ep={epochs} bs={batch_size}"
         print(f"[{idx + 1}/{len(new_combos)}] {run_label}  ———  {epochs} epochs, batch={batch_size}")
         t0 = time.time()
 
-        test_losses, test_accs = run_one(
+        test_losses, test_accs, metrics, _model = run_one(
             epochs, batch_size, X_train, y_train, X_test, y_test,
             n_ch, n_times, n_cls, device,
         )
 
         elapsed = time.time() - t0
-        results[(epochs, batch_size)] = (test_losses, test_accs)
+        results[(epochs, batch_size)] = (test_losses, test_accs, metrics)
         print(f"  done in {elapsed:.0f}s  |  final test_loss={test_losses[-1]:.4f}  "
-              f"test_acc={test_accs[-1]:.2%}\n")
+              f"test_acc={test_accs[-1]:.2%}")
+        print_metrics(metrics, CLASS_NAMES, title=run_label)
+        plot_spatial_filters(_model, run_dir, tag=f"_{run_label}")
 
         # Save after each combo — 防止中断丢失
         save_cache(results, CACHE_FILE)
 
+    # ---- 所有组合汇总表 ----
+    print(f"\n{'='*80}")
+    print(f"{'Summary':^80}")
+    print(f"{'='*80}")
+    print(f"{'Combo':>20s}  {'Test Acc':>9s}  {'p-value':>10s}  {'Signif':>6s}  "
+          f"{'left_hand':>9s}  {'right_hand':>9s}  {'feet':>9s}  {'tongue':>9s}")
+    print(f"{'-'*80}")
+    for (ep, bs), (_, _, m) in sorted(results.items(), key=lambda x: x[0][1]):
+        sig = "***" if m['p_value'] < 0.001 else ("**" if m['p_value'] < 0.01 else ("*" if m['p_value'] < 0.05 else ""))
+        pca = m['per_class_acc']
+        print(f"{f'ep={ep} bs={bs}':>20s}  {m['accuracy']:8.2%}  {m['p_value']:10.2e}  {sig:>6s}  "
+              f"{pca['left_hand']:8.2%}  {pca['right_hand']:8.2%}  {pca['feet']:8.2%}  {pca['tongue']:8.2%}")
+    print(f"{'='*80}")
+
     # Plot all curves
-    plot_all(results, OUTPUT_DIR)
+    plot_all(results, run_dir)
     print("Done.")
 
 

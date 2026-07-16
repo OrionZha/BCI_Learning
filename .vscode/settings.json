@@ -8,5 +8,6 @@
         "MNE_DATA": "/Users/zho/code/BCI_Learning/mne_data"
     },
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.analysis.autoImportCompletions": false
 }
